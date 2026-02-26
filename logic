@@ -1,0 +1,452 @@
+# import logging
+# from contextlib import closing
+# from datetime import datetime, timedelta
+# from functools import partial
+# import numpy as np
+# import pandas as pd
+# from common.mongo import Database, Mongodb
+# from common.druid import Druid
+# from common.rds import RDS
+# from decorators import exception_handler
+# from util.pipeline_utils import retry_operation
+# import pandas as pd
+# import logging
+# from pipeline.turbo_range_analysis.query import build_druid_query, get_rds_query
+
+# LOGGER = logging.getLogger(__name__)
+
+
+
+
+# MODEL_VARIANT_RANGE_MAP = {
+#     ("Turbo", "V1"): 120,
+#     ("Turbo", "V2"): 120,
+#     ("Turbo", "V3"): 150,
+# }
+
+# TABLE_NAMES = ["dev-vehicle-data", "vcu-proto-data-1"]
+
+# IMEI_BATCH_SIZE = 20
+
+# # Cycle-quality filters
+# MIN_DISCHARGE_DURATION_MIN = 2    # drop state=2 segments shorter than this (flicker/noise)
+# MIN_DISTANCE_KM = 1.0  # discharge must cover at least 1 km
+# MIN_SOC_CHARGED = 3    # charge must gain at least 3% SOC
+# # MAX_DISTANCE_KM = 300 
+
+# FINAL_COLUMNS = [
+#     "cycle_start_time", "cycle_end_time",
+#     "charge_start_time", "charge_end_time", "charge_duration_min",
+#     "soc_at_charge_start", "soc_at_charge_end", "soc_charged",
+#     "trip_transactions_charged",
+#     "discharge_start_time", "discharge_end_time", "discharge_duration_min",
+#     "soc_at_discharge_start", "soc_at_discharge_end", "soc_consumed",
+#     "trip_transactions_discharged",
+#     "odo_start", "odo_end", "distance_km", "odo_per_soc",
+# ]
+
+
+
+
+
+# LOGGER = logging.getLogger(__name__)
+
+
+
+
+
+
+
+# def _fetch_rds(rds_config: dict, days: int) -> pd.DataFrame:
+#     end_time   = datetime.utcnow()
+#     start_time = end_time - timedelta(days=days)
+
+#     LOGGER.info(f"RDS window  : {start_time} → {end_time}")
+
+#     rds = RDS(**rds_config)
+#     try:
+#         query,params = get_rds_query(
+#             start_time,
+#             end_time,
+#             MODEL_VARIANT_RANGE_MAP
+#         )
+#         cur = rds.conn.cursor()
+#         cur.execute(query,params)
+#         rows = cur.fetchall()
+
+#         if not rows:
+#             LOGGER.info("RDS query returned 0 rows.")
+#             cur.close()
+#             return pd.DataFrame()
+
+#         cols = [desc[0] for desc in cur.description]
+#         df = pd.DataFrame(rows, columns=cols)
+
+#         cur.close()
+#         LOGGER.info(f"RDS returned: {len(df)} vehicles")
+
+#         return df
+
+#     except Exception as e:
+#         LOGGER.error(f"Error executing RDS query: {e}", exc_info=True)
+#         return pd.DataFrame()
+
+#     finally:
+#         try:
+#             if hasattr(rds, "close"):
+#                 rds.close()
+#             elif hasattr(rds, "conn") and hasattr(rds.conn, "close"):
+#                 rds.conn.close()
+#         except Exception as e:
+#             LOGGER.debug(f"Error closing RDS connection: {e}")
+
+
+
+
+# def _query_druid(druid, imei_list, t_start, t_end, table):
+#     imei_list = [str(i).strip() for i in imei_list if i not in (None, '', 'None')]
+#     if not imei_list:
+#         LOGGER.info("Empty IMEI list — skipping query")
+#         return pd.DataFrame()
+
+#     sql = build_druid_query(imei_list, t_start, t_end, table)
+#     LOGGER.info(f"\n===== DRUID SQL ({table}) =====\n{sql}\n")
+
+#     with closing(druid.cursor()) as cursor:
+#         try:
+#             cursor.execute(sql)
+#             data = cursor.fetchall()
+#             return pd.DataFrame(data) if data else pd.DataFrame()
+
+#         except Exception as e:
+#             LOGGER.error(
+#                 f"Druid query failed for table={table}\n"
+#                 f"SQL:\n{sql}",
+#                 exc_info=True
+#             )
+#             raise
+
+
+# # Druid: fetch telemetry for the identified IMEIs
+
+# def _fetch_druid(druid: Druid, imei_list: list, days: int) -> pd.DataFrame:
+#     if not imei_list:
+#         LOGGER.warning("No IMEIs to query in Druid.")
+#         return pd.DataFrame()
+
+#     end   = pd.Timestamp.utcnow().floor("D")
+#     start = end - pd.Timedelta(days=days)
+
+
+#     intervals = pd.date_range(start=start, end=end, freq="1D")
+
+
+#     batches = [imei_list[i:i + IMEI_BATCH_SIZE] for i in range(0, len(imei_list), IMEI_BATCH_SIZE)]
+
+#     LOGGER.info(
+#         f"Druid window: {start} → {end} "
+#         f"| {len(intervals) - 1} day-windows "
+#         f"| {len(batches)} batches of up to {IMEI_BATCH_SIZE} IMEIs"
+#     )
+
+#     all_dfs = []
+
+#     for b_idx, batch in enumerate(batches, 1):
+#         for i in range(len(intervals) - 1):
+#             t_start = intervals[i].strftime("%Y-%m-%d %H:%M:%S")
+#             t_end   = intervals[i + 1].strftime("%Y-%m-%d %H:%M:%S")
+
+
+#             found_imeis = set()
+
+#             # ── PRIMARY 
+#             try:
+#                 df_primary = retry_operation(
+#                     "fetch_druid_primary",
+#                     partial(_query_druid, druid, batch, t_start, t_end, TABLE_NAMES[0]),
+#                 )
+
+#                 if df_primary is not None and not df_primary.empty:
+#                     df_primary["_source"] = TABLE_NAMES[0]
+#                     all_dfs.append(df_primary)
+#                     found_imeis = set(df_primary["imei"].astype(str).unique())
+#                     LOGGER.info(
+#                         f"Batch {b_idx}/{len(batches)} | Window {i + 1}/{len(intervals) - 1} "
+#                         f"| ✔ PRIMARY {len(df_primary)} rows | {len(found_imeis)} IMEIs"
+#                     )
+#                 else:
+#                     LOGGER.info(
+#                         f"Batch {b_idx}/{len(batches)} | Window {i + 1}/{len(intervals) - 1} "
+#                         f"| ✘ PRIMARY returned no rows"
+#                     )
+#             except Exception as e:
+#                 LOGGER.error(
+#                     f"Batch {b_idx}/{len(batches)} | Window {i + 1}/{len(intervals) - 1} "
+#                     f"| ✘ PRIMARY failed: {e}"
+#                 )
+
+#             # ── FALLBACK for IMEIs missing from primary 
+#             missing_imeis = list(set(str(im) for im in batch) - found_imeis)
+
+#             if missing_imeis:
+#                 try:
+#                     df_fallback = retry_operation(
+#                         "fetch_druid_fallback",
+#                         partial(_query_druid, druid, missing_imeis, t_start, t_end, TABLE_NAMES[1]),
+#                     )
+
+#                     if df_fallback is not None and not df_fallback.empty:
+#                         df_fallback["_source"] = TABLE_NAMES[1]
+#                         all_dfs.append(df_fallback)
+#                         LOGGER.info(
+#                             f"  ✔ FALLBACK {len(df_fallback)} rows "
+#                             f"| {df_fallback['imei'].nunique()} IMEIs"
+#                         )
+#                     else:
+#                         LOGGER.info(f"  ✘ No fallback data for {len(missing_imeis)} IMEIs")
+#                 except Exception as e:
+#                     LOGGER.error(f"  ✘ FALLBACK failed: {e}")
+#             else:
+#                 LOGGER.info("  ✔ All IMEIs found in PRIMARY")
+
+#     if not all_dfs:
+#         LOGGER.warning("No telemetry data returned from Druid.")
+#         return pd.DataFrame()
+
+#     result = pd.concat(all_dfs, ignore_index=True)
+
+
+#     if "_0" in result.columns:
+#         result.rename(columns={"_0": "__time"}, inplace=True)
+
+#     if "__time" in result.columns:
+#         result["__time"] = pd.to_datetime(result["__time"])
+#         result.sort_values(["imei", "__time"], inplace=True)
+#         result.reset_index(drop=True, inplace=True)
+
+#     LOGGER.info(
+#         f"Druid done | {len(result):,} rows | {result['imei'].nunique()} unique IMEIs "
+#         f"| sources: {result['_source'].unique().tolist()}"
+#     )
+#     return result
+
+
+# #Process charge / discharge cycles for a single IMEI
+
+
+# def _process_imei(imei_df: pd.DataFrame) -> pd.DataFrame:
+#     imei_df = imei_df.copy().sort_values("__time").reset_index(drop=True)
+
+#     for col in ("soc", "odometer", "vehicleStarkTicks", "vehicleState"):
+#         imei_df[col] = pd.to_numeric(imei_df[col], errors="coerce")
+
+#     # Segment by vehicleState change
+#     imei_df["state_run_id"] = (
+#         imei_df["vehicleState"] != imei_df["vehicleState"].shift()
+#     ).cumsum()
+
+#     # Collapse to one row per segment
+#     seg = imei_df.groupby("state_run_id").agg(
+#         state      = ("vehicleState", "first"),
+#         start_time = ("__time",       "first"),
+#         end_time   = ("__time",       "last"),
+#         soc_start  = ("soc",          "first"),
+#         soc_end    = ("soc",          "last"),
+#         odo_start  = ("odometer",     "first"),
+#         odo_end    = ("odometer",     "last"),
+#         n_packets  = ("__time",       "count"),
+#     ).reset_index()
+
+#     seg["duration_min"] = (
+#         seg["end_time"] - seg["start_time"]
+#     ).dt.total_seconds() / 60
+
+#     # Drop short flickering discharge segments
+#     seg = seg[
+#         (seg["state"] != 2) | (seg["duration_min"] >= MIN_DISCHARGE_DURATION_MIN)
+#     ].reset_index(drop=True)
+
+#     # Keep only charge (1) and discharge (2)
+#     seg = seg[seg["state"].isin([1, 2])].reset_index(drop=True)
+#     if seg.empty:
+#         return pd.DataFrame(columns=FINAL_COLUMNS)
+
+#     # Merge consecutive same-state runs
+#     seg["run_id"] = (seg["state"] != seg["state"].shift()).cumsum()
+
+#     def _merge_run(group):
+#         return pd.Series({
+#             "state"             : group["state"].iloc[0],
+#             "start_time"        : group["start_time"].iloc[0],
+#             "end_time"          : group["end_time"].iloc[-1],
+#             "soc_start"         : group["soc_start"].iloc[0],
+#             "soc_end"           : group["soc_end"].iloc[-1],
+#             "soc_delta_sum"     : (group["soc_end"] - group["soc_start"]).sum(),
+#             "odo_start"         : group["odo_start"].iloc[0],
+#             "odo_end"           : group["odo_end"].iloc[-1],
+#             "n_packets"         : group["n_packets"].sum(),
+#             "n_segments_merged" : len(group),
+#         })
+
+#     merged = seg.groupby("run_id", sort=True).apply(_merge_run).reset_index(drop=True)
+
+#     LOGGER.info(
+#         f"  Segments → Charging(1): {(merged.state == 1).sum()}  "
+#         f"Discharging(2): {(merged.state == 2).sum()}"
+#     )
+
+#     # Pair charge(1) → discharge(2) cycles
+#     cycles = []
+#     i = 0
+#     while i < len(merged) - 1:
+#         if merged.loc[i, "state"] == 1 and merged.loc[i + 1, "state"] == 2:
+#             charge    = merged.loc[i]
+#             discharge = merged.loc[i + 1]
+
+#             soc_consumed = discharge["soc_start"] - discharge["soc_end"]
+#             distance     = discharge["odo_end"]   - discharge["odo_start"]
+#             odo_per_soc  = np.nan if soc_consumed <= 0 else round(distance / soc_consumed, 4)
+
+#             cycles.append({
+#                 "cycle_start_time"            : charge["start_time"],
+#                 "cycle_end_time"              : discharge["end_time"],
+#                 "charge_start_time"           : charge["start_time"],
+#                 "charge_end_time"             : charge["end_time"],
+#                 "charge_duration_min"         : round((charge["end_time"] - charge["start_time"]).total_seconds() / 60, 2),
+#                 "soc_at_charge_start"         : charge["soc_start"],
+#                 "soc_at_charge_end"           : charge["soc_end"],
+#                 "soc_charged"                 : charge["soc_delta_sum"],
+#                 "trip_transactions_charged"   : int(charge["n_segments_merged"]),
+#                 "discharge_start_time"        : discharge["start_time"],
+#                 "discharge_end_time"          : discharge["end_time"],
+#                 "discharge_duration_min"      : round((discharge["end_time"] - discharge["start_time"]).total_seconds() / 60, 2),
+#                 "soc_at_discharge_start"      : discharge["soc_start"],
+#                 "soc_at_discharge_end"        : discharge["soc_end"],
+#                 "soc_consumed"                : abs(discharge["soc_delta_sum"]),
+#                 "trip_transactions_discharged": int(discharge["n_segments_merged"]),
+#                 "odo_start"                   : discharge["odo_start"],
+#                 "odo_end"                     : discharge["odo_end"],
+#                 "distance_km"                 : round(distance, 4),
+#                 "odo_per_soc"                 : odo_per_soc,
+#             })
+#             i += 2
+#         else:
+#             i += 1
+
+#     if not cycles:
+#         return pd.DataFrame(columns=FINAL_COLUMNS)
+
+#     cycles_df = pd.DataFrame(cycles)
+
+#     # Filter noise
+#     cycles_df = cycles_df[
+#         (cycles_df["distance_km"] >= MIN_DISTANCE_KM) & 
+#         (cycles_df["soc_charged"] >= MIN_SOC_CHARGED) &
+#         (cycles_df["odo_per_soc"].notna() & cycles_df["odo_per_soc"] < 4 )
+#     ].reset_index(drop=True)
+
+#     if cycles_df.empty:
+#         return pd.DataFrame(columns=FINAL_COLUMNS)
+
+#     # Make cycle boundaries continuous
+#     for idx in range(len(cycles_df)):
+#         cycles_df.loc[idx, "cycle_start_time"] = (
+#             cycles_df.loc[idx, "charge_start_time"]
+#             if idx == 0
+#             else cycles_df.loc[idx - 1, "cycle_end_time"]
+#         )
+
+#     return cycles_df[FINAL_COLUMNS]
+
+
+# def _process_all_imeis(df_druid: pd.DataFrame) -> pd.DataFrame:
+#     df = df_druid.copy()
+#     df["__time"]       = pd.to_datetime(df["__time"])
+#     df["vehicleState"] = pd.to_numeric(df["vehicleState"], errors="coerce")
+
+#     all_results = []
+#     for imei in df["imei"].unique():
+#         LOGGER.info(f"Processing IMEI: {imei}")
+#         result = _process_imei(df[df["imei"] == imei].copy())
+
+#         if result.empty:
+#             LOGGER.info("  → No meaningful cycles found")
+#             continue
+
+#         result.insert(0, "imei", imei)
+#         LOGGER.info(f"  → {len(result)} cycles found")
+#         all_results.append(result)
+
+#     if all_results:
+#         return pd.concat(all_results, ignore_index=True)
+
+#     return pd.DataFrame(columns=["imei"] + FINAL_COLUMNS)
+
+
+
+# # PIPELINE ENTRY POINT
+
+# @exception_handler
+# def get_range_analysis(
+#     rds_config: dict,
+#     druid: Druid,
+#     days: int,
+# ):
+#     """
+#     Pipeline entry point — called by the cron scheduler.
+
+#     Args:
+#         rds_config : rds config dict passed by the scheduler
+#         druid : Druid connection object
+#         days  : lookback window in days (e.g. 7 for last 7 days)
+
+#     Returns:
+#         pd.DataFrame of all charge/discharge cycles, or None on failure.
+#     """
+
+#     df_rds = _fetch_rds(rds_config, days)
+#     if df_rds.empty:
+#         LOGGER.warning("No low-range vehicles found in RDS. Exiting.")
+#         return None
+
+#     imei_list = df_rds["imei"].dropna().astype(str).unique().tolist()
+   
+
+#     LOGGER.info(f"IMEIs to analyse: {len(imei_list)}")
+
+   
+#     df_druid = _fetch_druid(druid, imei_list, days)
+#     if df_druid.empty:
+#         LOGGER.warning("No telemetry returned from Druid. Exiting.")
+#         return None
+
+ 
+#     final_df = _process_all_imeis(df_druid)
+    
+#     LOGGER.info(f"Total cycles found: {len(final_df)}")
+#     final_df.to_csv("vehicles_7_days.csv")
+
+#     from datetime import datetime, timezone
+
+#     if final_df is not None and not final_df.empty:
+
+#         final_df["created_at"] = datetime.now(timezone.utc)
+
+#         with Mongodb() as mongo:
+#             LOGGER.info(
+#                 f"Mongo connection: {mongo.client is not None} | mongo url: {mongo.db_uri}"
+#             )
+#             try:
+#                 mongo["Turbo_range_analysis_cycles"].insert_many(
+#                     final_df.to_dict(orient="records")
+#                 )
+#                 LOGGER.info(
+#                     f"Inserted {len(final_df)} records into 'Turbo_range_analysis'"
+#                 )
+#             except Exception as e:
+#                 LOGGER.error(f"Failed to insert into Mongo: {e}")
+#     else:
+#         LOGGER.info("No range degradation data to insert into MongoDB")
+
+
+#     return final_df
