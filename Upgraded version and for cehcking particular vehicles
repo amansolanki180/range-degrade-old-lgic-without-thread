@@ -1,0 +1,722 @@
+-updated logic and for checking of imei's--
+
+import logging
+import os
+import threading
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+from functools import partial
+
+import numpy as np
+import pandas as pd
+
+from common.mongo import Mongodb
+from common.druid import Druid
+from common.rds import RDS
+from decorators import exception_handler
+from util.pipeline_utils import retry_operation
+from pipeline.turbo_range_analysis.query import build_druid_query, get_rds_query
+
+LOGGER = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+MODEL_VARIANT_RANGE_MAP = {
+    ("Turbo", "V1"): 120,
+    ("Turbo", "V2"): 120,
+    ("Turbo", "V3"): 150,
+}
+
+TABLE_NAMES = ["dev-vehicle-data", "vcu-proto-data-1"]
+
+IMEI_BATCH_SIZE = 20
+MONGO_INSERT_BATCH_SIZE = 500
+
+# Cycle-quality filters
+MIN_DISCHARGE_DURATION_MIN = 2
+MIN_DISTANCE_KM = 1.0
+MIN_SOC_CHARGED = 3
+
+# Clustering
+IDLE_GAP_THRESHOLD_SEC = 180  # 3 min — splits clusters at gaps exceeding this
+MIN_SPEED_FRACTION = 0.50     # >=50% rows with speed>0 to qualify as ACTIVE
+
+VALID_CONTROLLER_MODES = [0, 1, 2]
+
+# Debug — set to True to export per-IMEI CSVs for inspection
+EXPORT_DEBUG_CSV = False
+# CSV_OUTPUT_DIR = "telemetry_csv"
+# DEBUG_IMEIS = {"860710085577677","860710085577073","861729074570260","860710085572256"}
+
+FINAL_COLUMNS = [
+    "cycle_start_time", "cycle_end_time",
+    "charge_start_time", "charge_end_time", "charge_duration_min",
+    "soc_at_charge_start", "soc_at_charge_end", "soc_charged",
+    "trip_transactions_charged",
+    "discharge_start_time", "discharge_end_time", "discharge_duration_min",
+    "soc_at_discharge_start", "soc_at_discharge_end", "soc_consumed",
+    "trip_transactions_discharged",
+    "odo_start", "odo_end", "distance_km", "odo_per_soc",
+    "controller_mode_0_pct",
+    "controller_mode_1_pct",
+    "controller_mode_2_pct",
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Data fetching (RDS + Druid) — unchanged
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _fetch_rds(rds_config: dict, days: int) -> pd.DataFrame:
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(days=days)
+    LOGGER.info(f"RDS window : {start_time} → {end_time}")
+    rds = RDS(**rds_config)
+    try:
+        query, params = get_rds_query(start_time, end_time, MODEL_VARIANT_RANGE_MAP)
+        cur = rds.conn.cursor()
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        if not rows:
+            LOGGER.info("RDS query returned 0 rows.")
+            cur.close()
+            return pd.DataFrame()
+        cols = [desc[0] for desc in cur.description]
+        df = pd.DataFrame(rows, columns=cols)
+        cur.close()
+        LOGGER.info(f"RDS returned: {len(df)} vehicles")
+        return df
+    except Exception as e:
+        LOGGER.error(f"Error executing RDS query: {e}", exc_info=True)
+        return pd.DataFrame()
+    finally:
+        try:
+            if hasattr(rds, "close"):
+                rds.close()
+            elif hasattr(rds, "conn") and hasattr(rds.conn, "close"):
+                rds.conn.close()
+        except Exception as e:
+            LOGGER.debug(f"Error closing RDS connection: {e}")
+
+
+def _query_druid(druid, imei_list, t_start, t_end, table):
+    imei_list = [str(i).strip() for i in imei_list if i not in (None, "", "None")]
+    if not imei_list:
+        LOGGER.info("Empty IMEI list — skipping query")
+        return pd.DataFrame()
+    sql = build_druid_query(imei_list, t_start, t_end, table)
+    LOGGER.info(f"\n===== DRUID SQL ({table}) =====\n{sql}\n")
+    with closing(druid.cursor()) as cursor:
+        try:
+            cursor.execute(sql)
+            data = cursor.fetchall()
+            return pd.DataFrame(data) if data else pd.DataFrame()
+        except Exception as e:
+            LOGGER.error(f"Druid query failed for table={table}\nSQL:\n{sql}", exc_info=True)
+            raise
+
+
+def _fetch_druid(druid: Druid, imei_list: list, days: int) -> pd.DataFrame:
+    if not imei_list:
+        LOGGER.warning("No IMEIs to query in Druid.")
+        return pd.DataFrame()
+    end = pd.Timestamp.utcnow().floor("D")
+    start = end - pd.Timedelta(days=days)
+    intervals = pd.date_range(start=start, end=end, freq="1D")
+    batches = [imei_list[i:i + IMEI_BATCH_SIZE] for i in range(0, len(imei_list), IMEI_BATCH_SIZE)]
+    LOGGER.info(
+        f"Druid window: {start} → {end} "
+        f"| {len(intervals) - 1} day-windows "
+        f"| {len(batches)} batches of up to {IMEI_BATCH_SIZE} IMEIs"
+    )
+    all_dfs = []
+    for b_idx, batch in enumerate(batches, 1):
+        for i in range(len(intervals) - 1):
+            t_start = intervals[i].strftime("%Y-%m-%d %H:%M:%S")
+            t_end = intervals[i + 1].strftime("%Y-%m-%d %H:%M:%S")
+            found_imeis = set()
+            try:
+                df_primary = retry_operation(
+                    "fetch_druid_primary",
+                    partial(_query_druid, druid, batch, t_start, t_end, TABLE_NAMES[0]),
+                )
+                if df_primary is not None and not df_primary.empty:
+                    df_primary["_source"] = TABLE_NAMES[0]
+                    all_dfs.append(df_primary)
+                    found_imeis = set(df_primary["imei"].astype(str).unique())
+                    LOGGER.info(
+                        f"Batch {b_idx}/{len(batches)} | Window {i + 1}/{len(intervals) - 1} "
+                        f"| ✔ PRIMARY {len(df_primary)} rows | {len(found_imeis)} IMEIs"
+                    )
+                else:
+                    LOGGER.info(
+                        f"Batch {b_idx}/{len(batches)} | Window {i + 1}/{len(intervals) - 1} "
+                        f"| ✘ PRIMARY returned no rows"
+                    )
+            except Exception as e:
+                LOGGER.error(
+                    f"Batch {b_idx}/{len(batches)} | Window {i + 1}/{len(intervals) - 1} "
+                    f"| ✘ PRIMARY failed: {e}"
+                )
+            missing_imeis = list(set(str(im) for im in batch) - found_imeis)
+            if missing_imeis:
+                try:
+                    df_fallback = retry_operation(
+                        "fetch_druid_fallback",
+                        partial(_query_druid, druid, missing_imeis, t_start, t_end, TABLE_NAMES[1]),
+                    )
+                    if df_fallback is not None and not df_fallback.empty:
+                        df_fallback["_source"] = TABLE_NAMES[1]
+                        all_dfs.append(df_fallback)
+                        LOGGER.info(
+                            f" ✔ FALLBACK {len(df_fallback)} rows "
+                            f"| {df_fallback['imei'].nunique()} IMEIs"
+                        )
+                    else:
+                        LOGGER.info(f" ✘ No fallback data for {len(missing_imeis)} IMEIs")
+                except Exception as e:
+                    LOGGER.error(f" ✘ FALLBACK failed: {e}")
+            else:
+                LOGGER.info(" ✔ All IMEIs found in PRIMARY")
+    if not all_dfs:
+        LOGGER.warning("No telemetry data returned from Druid.")
+        return pd.DataFrame()
+    result = pd.concat(all_dfs, ignore_index=True)
+    if "_0" in result.columns:
+        result.rename(columns={"_0": "__time"}, inplace=True)
+    if "__time" in result.columns:
+        result["__time"] = pd.to_datetime(result["__time"])
+        result.sort_values(["imei", "__time"], inplace=True)
+        result.reset_index(drop=True, inplace=True)
+    LOGGER.info(
+        f"Druid done | {len(result):,} rows | {result['imei'].nunique()} unique IMEIs "
+        f"| sources: {result['_source'].unique().tolist()}"
+    )
+    return result
+
+
+def _compute_controller_mode_percentage(
+    raw_df: pd.DataFrame, start_time, end_time, discharge_duration_min: float
+) -> dict:
+    """
+    Compute % time in each controller mode during active discharge.
+    Filters to vehicleState=2 only so percentages cannot exceed 100%.
+    Uses inter-row gaps as durations; last row gets 0.
+    """
+    result = {m: 0.0 for m in VALID_CONTROLLER_MODES}
+    if not discharge_duration_min or discharge_duration_min <= 0:
+        return result
+    total_discharge_sec = discharge_duration_min * 60
+    mask = (
+        (raw_df["__time"] >= start_time) &
+        (raw_df["__time"] <= end_time) &
+        (raw_df["vehicleState"] == 2)
+    )
+    window = raw_df.loc[mask, ["__time", "controllerControllerMode"]].copy()
+    if window.empty:
+        return result
+    window = window.sort_values("__time").reset_index(drop=True)
+    window["controllerControllerMode"] = pd.to_numeric(
+        window["controllerControllerMode"], errors="coerce"
+    )
+    window = window[window["controllerControllerMode"].isin(VALID_CONTROLLER_MODES)]
+    if window.empty:
+        return result
+    window["duration_sec"] = (
+        window["__time"].shift(-1) - window["__time"]
+    ).dt.total_seconds().fillna(0).clip(lower=0)
+    mode_secs = window.groupby("controllerControllerMode")["duration_sec"].sum()
+    total_mode_sec = mode_secs.sum()
+    # Cap: if total mode time exceeds active discharge time, normalize to 100%
+    for mode in VALID_CONTROLLER_MODES:
+        mode_sec = mode_secs.get(mode, 0.0)
+        if total_mode_sec > 0 and total_mode_sec > total_discharge_sec:
+            result[mode] = round((mode_sec / total_mode_sec) * 100, 2)
+        else:
+            result[mode] = round((mode_sec / total_discharge_sec) * 100, 2)
+    return result
+
+
+def _compute_active_discharge_duration(
+    raw_df: pd.DataFrame, start_time, end_time
+) -> tuple:
+    """
+    Compute active discharge duration and real trip count.
+
+    Filters to vehicleState=2 rows, clusters by time gaps, and counts only
+    clusters with odo movement + >=50% speed rows as active.
+    Real trips must also cover >= MIN_DISTANCE_KM.
+
+    Returns (active_duration_min, real_trip_count).
+    """
+    mask = (
+        (raw_df["__time"] >= start_time) &
+        (raw_df["__time"] <= end_time) &
+        (raw_df["vehicleState"] == 2)
+    )
+    window = raw_df.loc[mask, ["__time", "odometer", "controllerSpeed"]].copy()
+    if len(window) < 2:
+        return 0.0, 0
+    window = window.sort_values("__time").reset_index(drop=True)
+    window["odometer"] = pd.to_numeric(window["odometer"], errors="coerce")
+    window["controllerSpeed"] = pd.to_numeric(window["controllerSpeed"], errors="coerce")
+    gap_sec = window["__time"].diff().dt.total_seconds().fillna(0)
+    window["cluster_id"] = (gap_sec > IDLE_GAP_THRESHOLD_SEC).cumsum()
+
+    active_sec = 0.0
+    trip_count = 0
+    for _, cluster in window.groupby("cluster_id"):
+        if len(cluster) < 2:
+            continue
+        odo_s, odo_e = cluster["odometer"].iloc[0], cluster["odometer"].iloc[-1]
+        if not (pd.notna(odo_s) and pd.notna(odo_e) and odo_e > odo_s):
+            continue
+        if (cluster["controllerSpeed"] > 0).mean() < MIN_SPEED_FRACTION:
+            continue
+        active_sec += (cluster["__time"].iloc[-1] - cluster["__time"].iloc[0]).total_seconds()
+        if (odo_e - odo_s) >= MIN_DISTANCE_KM:
+            trip_count += 1
+    return round(active_sec / 60, 2), trip_count
+
+
+def _compute_active_charge_duration(
+    raw_df: pd.DataFrame, start_time, end_time
+) -> tuple:
+    """
+    Compute actual charging duration and real session count.
+
+    Filters to vehicleState=1 rows, clusters by time gaps.
+    Only sessions where SOC increased >= MIN_SOC_CHARGED count as real.
+
+    Returns (charge_duration_min, real_session_count).
+    """
+    mask = (
+        (raw_df["__time"] >= start_time) &
+        (raw_df["__time"] <= end_time) &
+        (raw_df["vehicleState"] == 1)
+    )
+    window = raw_df.loc[mask, ["__time", "soc"]].copy()
+    if len(window) < 2:
+        return 0.0, 0
+    window = window.sort_values("__time").reset_index(drop=True)
+    window["soc"] = pd.to_numeric(window["soc"], errors="coerce")
+    gap_sec = window["__time"].diff().dt.total_seconds().fillna(0)
+    window["cluster_id"] = (gap_sec > IDLE_GAP_THRESHOLD_SEC).cumsum()
+
+    charge_sec = 0.0
+    session_count = 0
+    for _, cluster in window.groupby("cluster_id"):
+        if len(cluster) < 2:
+            continue
+        soc_start = cluster["soc"].iloc[0]
+        if soc_start >= 100:
+            continue
+        hit_full = cluster[cluster["soc"] >= 100]
+        if not hit_full.empty:
+            effective_end = hit_full["__time"].iloc[0]
+        else:
+            effective_end = cluster["__time"].iloc[-1]
+        soc_at_end = cluster.loc[cluster["__time"] <= effective_end, "soc"].iloc[-1]
+        dur = (effective_end - cluster["__time"].iloc[0]).total_seconds()
+        if dur > 0:
+            charge_sec += dur
+        if (soc_at_end - soc_start) >= MIN_SOC_CHARGED:
+            session_count += 1
+    return round(charge_sec / 60, 2), session_count
+
+
+def _find_hidden_charge_runs(
+    raw_df: pd.DataFrame, start_time, end_time
+) -> list:
+    """
+    Find vehicleState=1 runs (>2 min) inside a discharge window.
+    Returns list of dicts or empty list if discharge is clean.
+    """
+    mask = (raw_df["__time"] >= start_time) & (raw_df["__time"] <= end_time)
+    window = raw_df.loc[mask, ["__time", "vehicleState", "soc"]].copy()
+    if window.empty:
+        return []
+    window = window.sort_values("__time").reset_index(drop=True)
+    window["run_id"] = (window["vehicleState"] != window["vehicleState"].shift()).cumsum()
+
+    charge_runs = []
+    for _, grp in window[window["vehicleState"] == 1].groupby("run_id"):
+        dur_min = (grp["__time"].iloc[-1] - grp["__time"].iloc[0]).total_seconds() / 60
+        if dur_min < MIN_DISCHARGE_DURATION_MIN:
+            continue
+        charge_runs.append({
+            "start": grp["__time"].iloc[0],
+            "end": grp["__time"].iloc[-1],
+            "soc_start": grp["soc"].iloc[0],
+            "soc_end": grp["soc"].iloc[-1],
+            "soc_charged": grp["soc"].iloc[-1] - grp["soc"].iloc[0],
+        })
+    if charge_runs:
+        LOGGER.info(
+            f"  Found {len(charge_runs)} hidden charge run(s): "
+            + ", ".join(f"SOC {c['soc_start']:.0f}→{c['soc_end']:.0f}" for c in charge_runs)
+        )
+    return charge_runs
+
+
+def _get_boundary(raw_df: pd.DataFrame, t):
+    """Get SOC and odometer at the nearest row to time t. Uses searchsorted for speed."""
+    times = raw_df["__time"]
+    idx = times.searchsorted(t)
+    # Pick the closer of idx-1 and idx
+    if idx == 0:
+        row = raw_df.iloc[0]
+    elif idx >= len(raw_df):
+        row = raw_df.iloc[-1]
+    else:
+        before = abs((times.iloc[idx - 1] - t).total_seconds())
+        after = abs((times.iloc[idx] - t).total_seconds())
+        row = raw_df.iloc[idx - 1] if before <= after else raw_df.iloc[idx]
+    return {"soc": row["soc"], "odo": row["odometer"]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Cycle building
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_cycle(imei_df, charge, discharge):
+    """Build a single cycle dict from charge and discharge segments."""
+    soc_consumed = discharge["soc_start"] - discharge["soc_end"]
+    distance = discharge["odo_end"] - discharge["odo_start"]
+    odo_per_soc = np.nan if soc_consumed <= 0 else round(distance / soc_consumed, 4)
+
+    discharge_duration_min, trip_count = _compute_active_discharge_duration(
+        imei_df, discharge["start_time"], discharge["end_time"]
+    )
+    charge_duration_min, charge_sessions = _compute_active_charge_duration(
+        imei_df, charge["start_time"], charge["end_time"]
+    )
+    mode_pct = _compute_controller_mode_percentage(
+        imei_df, discharge["start_time"], discharge["end_time"], discharge_duration_min
+    )
+    return {
+        "cycle_start_time":             charge["start_time"],
+        "cycle_end_time":               discharge["end_time"],
+        "charge_start_time":            charge["start_time"],
+        "charge_end_time":              charge["end_time"],
+        "charge_duration_min":          charge_duration_min,
+        "soc_at_charge_start":          charge["soc_start"],
+        "soc_at_charge_end":            charge["soc_end"],
+        "soc_charged":                  charge.get("soc_delta_sum", charge["soc_end"] - charge["soc_start"]),
+        "trip_transactions_charged":    charge_sessions,
+        "discharge_start_time":         discharge["start_time"],
+        "discharge_end_time":           discharge["end_time"],
+        "discharge_duration_min":       discharge_duration_min,
+        "soc_at_discharge_start":       discharge["soc_start"],
+        "soc_at_discharge_end":         discharge["soc_end"],
+        "soc_consumed":                 abs(soc_consumed),
+        "trip_transactions_discharged": trip_count,
+        "odo_start":                    discharge["odo_start"],
+        "odo_end":                      discharge["odo_end"],
+        "distance_km":                  round(distance, 4),
+        "odo_per_soc":                  odo_per_soc,
+        "controller_mode_0_pct":        mode_pct[0],
+        "controller_mode_1_pct":        mode_pct[1],
+        "controller_mode_2_pct":        mode_pct[2],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Per-IMEI processing
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _export_debug_csv(imei: str, imei_df: pd.DataFrame):
+    """Export raw telemetry CSV with discharge-only clustering for inspection."""
+    os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
+    df = imei_df.copy().sort_values("__time").reset_index(drop=True)
+    for col in ("soc", "odometer", "controllerSpeed", "vehicleState",
+                "controllerControllerMode"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["gap_sec"] = df["__time"].diff().dt.total_seconds().fillna(0).round(1)
+
+    dis_mask = df["vehicleState"] == 2
+    dis_df = df.loc[dis_mask].copy()
+    dis_gaps = dis_df["__time"].diff().dt.total_seconds().fillna(0)
+    dis_df["cluster_id"] = (dis_gaps > IDLE_GAP_THRESHOLD_SEC).cumsum()
+
+    labels = {}
+    for cid, grp in dis_df.groupby("cluster_id"):
+        if len(grp) < 2:
+            labels[cid] = "IDLE"
+            continue
+        odo_s, odo_e = grp["odometer"].iloc[0], grp["odometer"].iloc[-1]
+        has_odo = pd.notna(odo_s) and pd.notna(odo_e) and odo_e > odo_s
+        has_speed = (grp["controllerSpeed"] > 0).mean() >= MIN_SPEED_FRACTION
+        labels[cid] = "ACTIVE" if (has_odo and has_speed) else "IDLE"
+
+    df["cluster_id"] = -1
+    df.loc[dis_mask, "cluster_id"] = dis_df["cluster_id"]
+    df["cluster_status"] = df["cluster_id"].map(labels).fillna("NON-DISCHARGE")
+    csv_cols = [c for c in [
+        "__time", "imei", "vehicleState", "soc", "odometer",
+        "controllerSpeed", "controllerControllerMode",
+        "gap_sec", "cluster_id", "cluster_status",
+    ] if c in df.columns]
+    filepath = os.path.join(CSV_OUTPUT_DIR, f"{imei}_telemetry.csv")
+    df[csv_cols].to_csv(filepath, index=False)
+    LOGGER.info(f"  Debug CSV exported: {filepath} ({len(df)} rows)")
+
+
+def _process_imei(imei_df: pd.DataFrame) -> pd.DataFrame:
+    imei_df = imei_df.copy().sort_values("__time").reset_index(drop=True)
+    for col in ("soc", "odometer", "vehicleStarkTicks", "vehicleState", "controllerSpeed"):
+        if col in imei_df.columns:
+            imei_df[col] = pd.to_numeric(imei_df[col], errors="coerce")
+
+    # --- Segment by vehicleState transitions ---
+    imei_df["state_run_id"] = (imei_df["vehicleState"] != imei_df["vehicleState"].shift()).cumsum()
+    seg = imei_df.groupby("state_run_id").agg(
+        state=("vehicleState", "first"),
+        start_time=("__time", "first"),
+        end_time=("__time", "last"),
+        soc_start=("soc", "first"),
+        soc_end=("soc", "last"),
+        odo_start=("odometer", "first"),
+        odo_end=("odometer", "last"),
+        n_packets=("__time", "count"),
+    ).reset_index()
+    seg["duration_min"] = (seg["end_time"] - seg["start_time"]).dt.total_seconds() / 60
+
+    # Drop tiny discharge blips, keep only charge(1) and discharge(2)
+    seg = seg[(seg["state"] != 2) | (seg["duration_min"] >= MIN_DISCHARGE_DURATION_MIN)]
+    seg = seg[seg["state"].isin([1, 2])].reset_index(drop=True)
+    if seg.empty:
+        return pd.DataFrame(columns=FINAL_COLUMNS)
+
+    # --- Merge consecutive same-state segments ---
+    seg["run_id"] = (seg["state"] != seg["state"].shift()).cumsum()
+
+    def _merge_run(group):
+        return pd.Series({
+            "state":         group["state"].iloc[0],
+            "start_time":    group["start_time"].iloc[0],
+            "end_time":      group["end_time"].iloc[-1],
+            "soc_start":     group["soc_start"].iloc[0],
+            "soc_end":       group["soc_end"].iloc[-1],
+            "soc_delta_sum": (group["soc_end"] - group["soc_start"]).sum(),
+            "odo_start":     group["odo_start"].iloc[0],
+            "odo_end":       group["odo_end"].iloc[-1],
+        })
+
+    merged = seg.groupby("run_id", sort=True).apply(_merge_run).reset_index(drop=True)
+    LOGGER.info(
+        f" Segments → Charging(1): {(merged.state == 1).sum()} "
+        f"Discharging(2): {(merged.state == 2).sum()}"
+    )
+
+    # --- Find charge→discharge pairs and build cycles ---
+    cycles = []
+    i = 0
+    while i < len(merged):
+        if (
+            i < len(merged) - 1
+            and merged.loc[i, "state"] == 1
+            and merged.loc[i + 1, "state"] == 2
+        ):
+            charge = merged.loc[i]
+            discharge = merged.loc[i + 1]
+            hidden_charges = _find_hidden_charge_runs(
+                imei_df, discharge["start_time"], discharge["end_time"]
+            )
+
+            if not hidden_charges:
+                cycle = _build_cycle(imei_df, charge, discharge)
+                if cycle:
+                    cycles.append(cycle)
+            else:
+                # Split discharge around hidden charging sessions
+                LOGGER.info(
+                    f"  Splitting discharge into sub-cycles around "
+                    f"{len(hidden_charges)} hidden charge run(s)"
+                )
+                # Sub-cycle 1: original charge → discharge before first hidden charge
+                b_s = _get_boundary(imei_df, discharge["start_time"])
+                b_hc = _get_boundary(imei_df, hidden_charges[0]["start"])
+                sub_dis = {
+                    "start_time": discharge["start_time"],
+                    "end_time": hidden_charges[0]["start"],
+                    "soc_start": b_s["soc"], "soc_end": b_hc["soc"],
+                    "odo_start": b_s["odo"], "odo_end": b_hc["odo"],
+                }
+                cycle = _build_cycle(imei_df, charge, sub_dis)
+                if cycle:
+                    cycles.append(cycle)
+
+                # Each hidden charge → next discharge segment
+                for hc_idx, hc in enumerate(hidden_charges):
+                    sub_charge = {
+                        "start_time": hc["start"], "end_time": hc["end"],
+                        "soc_start": hc["soc_start"], "soc_end": hc["soc_end"],
+                        "soc_delta_sum": hc["soc_charged"],
+                    }
+                    next_end = (
+                        hidden_charges[hc_idx + 1]["start"]
+                        if hc_idx + 1 < len(hidden_charges)
+                        else discharge["end_time"]
+                    )
+                    b_he = _get_boundary(imei_df, hc["end"])
+                    b_ne = _get_boundary(imei_df, next_end)
+                    sub_dis = {
+                        "start_time": hc["end"], "end_time": next_end,
+                        "soc_start": b_he["soc"], "soc_end": b_ne["soc"],
+                        "odo_start": b_he["odo"], "odo_end": b_ne["odo"],
+                    }
+                    cycle = _build_cycle(imei_df, sub_charge, sub_dis)
+                    if cycle:
+                        cycles.append(cycle)
+            i += 2
+        else:
+            i += 1
+
+    if not cycles:
+        return pd.DataFrame(columns=FINAL_COLUMNS)
+    cycles_df = pd.DataFrame(cycles)
+
+    # --- Apply cycle-quality filters ---
+    cycles_df = cycles_df[
+        (cycles_df["distance_km"] >= MIN_DISTANCE_KM) &
+        (cycles_df["soc_charged"] >= MIN_SOC_CHARGED) &
+        (cycles_df["soc_charged"] <= 100) &
+        (cycles_df["odo_per_soc"].notna()) &
+        (cycles_df["odo_per_soc"] < 4)
+    ].reset_index(drop=True)
+
+    if cycles_df.empty:
+        return pd.DataFrame(columns=FINAL_COLUMNS)
+
+    # Adjust cycle_start_time to chain from previous cycle
+    for idx in range(len(cycles_df)):
+        cycles_df.loc[idx, "cycle_start_time"] = (
+            cycles_df.loc[idx, "charge_start_time"]
+            if idx == 0
+            else cycles_df.loc[idx - 1, "cycle_end_time"]
+        )
+    return cycles_df[FINAL_COLUMNS]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Orchestration
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _process_all_imeis(df_druid: pd.DataFrame) -> pd.DataFrame:
+    df = df_druid.copy()
+    df["__time"] = pd.to_datetime(df["__time"])
+    df["vehicleState"] = pd.to_numeric(df["vehicleState"], errors="coerce")
+    all_results = []
+    for imei in df["imei"].unique():
+        LOGGER.info(f"Processing IMEI: {imei}")
+        imei_data = df[df["imei"] == imei].copy()
+        if EXPORT_DEBUG_CSV and str(imei) in DEBUG_IMEIS:
+            try:
+                _export_debug_csv(str(imei), imei_data)
+            except Exception as e:
+                LOGGER.warning(f"  CSV export failed for {imei}: {e}")
+        result = _process_imei(imei_data)
+        if result.empty:
+            LOGGER.info(" → No meaningful cycles found")
+            continue
+        result.insert(0, "imei", imei)
+        LOGGER.info(f" → {len(result)} cycles found")
+        all_results.append(result)
+    if all_results:
+        return pd.concat(all_results, ignore_index=True)
+    return pd.DataFrame(columns=["imei"] + FINAL_COLUMNS)
+
+
+# def _insert_to_mongo(df: pd.DataFrame):
+    # total = len(df)
+    # inserted = 0
+    # failed = 0
+    # try:
+    #     with Mongodb() as mongo:
+    #         collection = mongo["Turbo_range_analysis_cycles"]
+    #         for start in range(0, total, MONGO_INSERT_BATCH_SIZE):
+    #             batch_df = df.iloc[start: start + MONGO_INSERT_BATCH_SIZE]
+    #             records = batch_df.to_dict(orient="records")
+    #             try:
+    #                 collection.insert_many(records, ordered=False)
+    #                 inserted += len(records)
+    #                 LOGGER.info(
+    #                     f"Mongo insert | batch {start // MONGO_INSERT_BATCH_SIZE + 1} "
+    #                     f"| {inserted}/{total} records done"
+    #                 )
+    #             except Exception as e:
+    #                 failed += len(records)
+    #                 LOGGER.error(
+    #                     f"Mongo insert | batch {start // MONGO_INSERT_BATCH_SIZE + 1} "
+    #                     f"failed | {failed} records lost: {e}"
+    #                 )
+    #             del records, batch_df
+    # except Exception as e:
+    #     LOGGER.error(f"Mongo connection failed during batch insert: {e}", exc_info=True)
+    # LOGGER.info(f"Mongo insert complete | ✔ {inserted} inserted | ✘ {failed} failed out of {total}")
+
+
+@exception_handler
+def get_range_analysis(rds_config: dict, druid: Druid, days: int):
+    today = datetime.now(timezone.utc)
+    df_rds = _fetch_rds(rds_config, days)
+    if df_rds.empty:
+        LOGGER.warning("No low-range vehicles found in RDS. Exiting.")
+        return None
+    # imei_list = df_rds["imei"].dropna().astype(str).unique().tolist()
+    imei_list = ["860710085577677","860710085577073","861729074570260","860710085572256"]
+    LOGGER.info(f"IMEIs from RDS: {len(imei_list)}")
+    with Mongodb() as mongo:
+        known_imeis = set(
+            mongo["Turbo_range_analysis_cycles"].distinct("imei", {"imei": {"$in": imei_list}})
+        )
+    new_imeis = [i for i in imei_list if i not in known_imeis]
+    old_imeis = [i for i in imei_list if i in known_imeis]
+    LOGGER.info(
+        f"New IMEIs → {days}-day lookback: {len(new_imeis)} "
+        f"| Known IMEIs → today only: {len(old_imeis)}"
+    )
+    batched_work = [
+        (new_imeis[i: i + IMEI_BATCH_SIZE], days)
+        for i in range(0, len(new_imeis), IMEI_BATCH_SIZE)
+    ] + [
+        (old_imeis[i: i + IMEI_BATCH_SIZE], 1)
+        for i in range(0, len(old_imeis), IMEI_BATCH_SIZE)
+    ]
+    LOGGER.info(f"Total batches to process: {len(batched_work)}")
+    all_results = []
+    insert_threads = []
+    for b_idx, (batch, fetch_days) in enumerate(batched_work, 1):
+        LOGGER.info(
+            f"── Batch {b_idx}/{len(batched_work)} "
+            f"| {len(batch)} IMEIs | {fetch_days}-day window ──"
+        )
+        df_druid = _fetch_druid(druid, batch, fetch_days)
+        if df_druid.empty:
+            LOGGER.info(f"Batch {b_idx}: no telemetry — skipping")
+            continue
+        batch_result = _process_all_imeis(df_druid)
+        del df_druid
+        if batch_result.empty:
+            LOGGER.info(f"Batch {b_idx}: no cycles found — skipping")
+            del batch_result
+            continue
+        batch_result["created_at"] = today
+        LOGGER.info(f"Batch {b_idx}: {len(batch_result)} cycles found")
+        # t = threading.Thread(target=_insert_to_mongo, args=(batch_result.copy(),), daemon=True)
+        # t.start()
+        # insert_threads.append(t)
+        all_results.append(batch_result)
+        LOGGER.info(f"Batch {b_idx}: insert kicked off, moving to next batch")
+    for t in insert_threads:
+        t.join()
+    LOGGER.info("All background inserts completed.")
+    if not all_results:
+        LOGGER.warning("No cycles found across all batches.")
+        return pd.DataFrame(columns=["imei"] + FINAL_COLUMNS)
+    final_df = pd.concat(all_results, ignore_index=True)
+    LOGGER.info(f"Total cycles across all batches: {len(final_df)}")
+    return final_df
